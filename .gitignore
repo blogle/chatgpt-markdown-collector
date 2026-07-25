@@ -1,0 +1,6 @@
+node_modules/
+.tmp/
+state/
+output/
+.env.local
+config.yaml

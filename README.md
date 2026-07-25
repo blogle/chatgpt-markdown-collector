@@ -1,0 +1,21 @@
+# ChatGPT Markdown Collector
+
+An unattended, validation-first wrapper around a pinned `chatgpt-exporter` executable. The exporter owns API access and Markdown generation; this project only runs it, validates the staged result, and publishes referenced Markdown/assets.
+
+## Usage
+
+Copy `config.example.yaml` to `config.yaml`, set the pinned executable, and provide its token through the configured environment variable (normally `CHATGPT_TOKEN`):
+
+```sh
+chatgpt-markdown-collector sync --config ./config.yaml
+chatgpt-markdown-collector verify --config ./config.yaml
+chatgpt-markdown-collector status --config ./config.yaml
+```
+
+Each project mapping is run separately with the upstream 1.1.0 arguments `backup`, `-o`, `--incremental`, `--download-files`, `--project`, `--concurrency`, and `--delay`. When the executable does not support `CHATGPT_TOKEN`, set `supports_token_env: false` to use `backup --token` instead. Persistent raw incremental data is stored under `state/upstream-export/<project>`. Publication is staged and per-file atomic; equal hashes preserve output mtimes, and a lock prevents overlap. Raw runs and manifests stay under `state`; only validated `.md` files and locally referenced assets reach `output`. Existing output is never deleted. A failed, expired, rate-limited, interrupted, or invalid run does not publish.
+
+The collector records run times, SHA-256 hashes, project counts and added/changed/unchanged comparisons, upstream identity, auth/publication/error/skipped details, and failure classifications in `state/manifest.json` and `state/collector-state.json`.
+
+## Nix and Docker
+
+Use `nix develop`, `nix flake check`, `nix build .#collector`, `nix build .#upstream`, or `nix build .#oci`. The flake pins nixpkgs, Node 22, the wrapper dependencies, and upstream revision `c0185e8937b7e3d19a5f1f34aab5d49fa8d1aa7e`; runtime has no network dependency. The OCI image keeps `/data` and `/state` as persistent volumes.

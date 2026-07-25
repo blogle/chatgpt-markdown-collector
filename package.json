@@ -1,0 +1,27 @@
+{
+  "name": "chatgpt-markdown-collector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "bin": {
+    "chatgpt-markdown-collector": "src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test",
+    "lint": "node --check src/cli.js && node --check src/collector.js",
+    "build": "node --check src/cli.js && node --check src/collector.js"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
+  "upstream": {
+    "name": "chatgpt-exporter",
+    "version": "1.1.0",
+    "revision": "c0185e8937b7e3d19a5f1f34aab5d49fa8d1aa7e",
+    "integrity": "sha512-UGMzldzZMwu/551ewevfPJcoqrIY2I6w4btfvFWFLKQflxQubRR4n1U03TWtUUw72NMjL+OyI0nm8CYr6i6pqw==",
+    "license": "MIT"
+  }
+}

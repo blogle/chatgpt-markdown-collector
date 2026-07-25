@@ -1,0 +1,13 @@
+exporter:
+  # Defaults to chatgpt-exporter. The flake runtime puts the pinned binary on PATH.
+  # Set false only for an exporter that requires --token instead of CHATGPT_TOKEN.
+  supports_token_env: true
+  concurrency: 3
+  delay_ms: 250
+  timeout_ms: 600000
+token_env: CHATGPT_TOKEN
+state_dir: ./state
+output_dir: ./output
+projects:
+  - id: project-id
+    name: Project name
