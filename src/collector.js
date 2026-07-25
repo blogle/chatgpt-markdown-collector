@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { parse as parseYaml } from 'yaml';
+import { configuredTokenCommand, runTokenCommand } from './credential-provider.js';
 
 export const UPSTREAM = {
   name: 'chatgpt-exporter', version: '1.1.0',
@@ -54,6 +55,9 @@ export async function loadConfig(file) {
     const output = safeRelative(String(project.output || id), `project ${id} output`, true);
     return { ...project, id, output };
   });
+  if (config.token_command !== undefined && !configuredTokenCommand(config.token_command)) throw new Error('token_command must be a non-empty argv list');
+  const tokenEnv = config.token_env || 'CHATGPT_TOKEN';
+  if (typeof tokenEnv !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokenEnv)) throw new Error('token_env must be a valid environment variable name');
   const destinations = new Set();
   for (const project of projects) {
     if ([...destinations].some((destination) => destination === project.output || destination.startsWith(`${project.output}/`) || project.output.startsWith(`${destination}/`))) throw new Error(`duplicate project destination: ${project.output}`);
@@ -61,7 +65,9 @@ export async function loadConfig(file) {
   }
   return {
     ...config, root, stateDir, outputDir, projects,
-    tokenEnv: config.token_env || 'CHATGPT_TOKEN',
+    tokenEnv,
+    tokenCommand: config.token_command,
+    tokenCommandTimeoutMs: Number.isFinite(config.token_command_timeout_ms) ? config.token_command_timeout_ms : 15000,
     auth: { preflight: true, endpoint: AUTH_ENDPOINT, timeout_ms: 15000, status_ttl_ms: 60000, ...(config.auth || {}) },
     exporter: { concurrency: 3, delay_ms: 0, timeout_ms: 600000, timeout_grace_ms: 5000, supports_token_env: true, executable: 'chatgpt-exporter', ...(config.exporter || {}),
       executable: /[\\/]/.test((config.exporter || {}).executable || 'chatgpt-exporter') ? resolve(root, (config.exporter || {}).executable) : ((config.exporter || {}).executable || 'chatgpt-exporter') }
@@ -220,6 +226,13 @@ function runExporter(config, project, output, token, signal) {
   });
 }
 
+async function resolveToken(config, suppliedToken, dependencies) {
+  if (suppliedToken !== undefined) return { token: suppliedToken, classification: suppliedToken ? 'credential-configured' : 'no-credential' };
+  if (configuredTokenCommand(config.tokenCommand)) return runTokenCommand(config.tokenCommand, config.tokenCommandTimeoutMs);
+  const token = process.env[config.tokenEnv];
+  return { token, classification: token ? 'credential-configured' : 'no-credential' };
+}
+
 async function atomicCopy(source, destination) {
   await fs.mkdir(path.dirname(destination), { recursive: true });
   const parent = path.dirname(destination);
@@ -325,10 +338,12 @@ async function recordFailure(config, classification, error, runId = null, starte
   return result;
 }
 
-export async function sync(config, token = process.env[config.tokenEnv], dependencies = {}) {
+export async function sync(config, token, dependencies = {}) {
   const startedAt = new Date().toISOString();
   const runId = `${startedAt.replaceAll(':', '-').replaceAll('.', '-')}-${randomUUID()}`;
-  if (!token) return recordFailure(config, 'no-credential', 'credential is not configured', runId, startedAt, { status: 'no-credential', classification: 'no-credential' });
+  const provided = await resolveToken(config, token, dependencies);
+  token = provided.token;
+  if (!token) return recordFailure(config, provided.classification, 'credential provider did not provide a usable credential', runId, startedAt, { status: 'failed', classification: provided.classification });
   const controller = new AbortController();
   const interrupt = () => controller.abort();
   process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
@@ -402,13 +417,14 @@ export async function verify(config) {
   return failures.length ? { status: 'invalid', failures } : { status: 'ok', run_id: manifest.run_id, counts: manifest.counts };
 }
 
-export async function status(config, token = process.env[config.tokenEnv], dependencies = {}) {
+export async function status(config, token, dependencies = {}) {
   const file = path.join(config.stateDir, 'collector-state.json');
   const collector = (await exists(file)) ? JSON.parse(await fs.readFile(file, 'utf8')) : { status: 'never-run' };
   const age = collector.auth?.checked_at ? Date.now() - Date.parse(collector.auth.checked_at) : Infinity;
   const cached = ['ready', 'rejected'].includes(collector.auth?.status) && age >= 0 && age <= config.auth.status_ttl_ms;
+  const provided = await resolveToken(config, token, dependencies);
   const auth = config.auth.preflight
-    ? cached ? collector.auth : await authenticationPreflight(config, token, { ...dependencies, deviceId: collector.auth?.device_id })
+    ? cached ? collector.auth : provided.token ? await authenticationPreflight(config, provided.token, { ...dependencies, deviceId: collector.auth?.device_id }) : { status: 'failed', classification: provided.classification, ready: false }
     : { status: 'not-checked', classification: 'preflight-disabled', ready: null };
   return { ...collector, auth };
 }

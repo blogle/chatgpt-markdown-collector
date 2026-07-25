@@ -35,7 +35,7 @@ await writeFile(path.join(out, 'private.json'), '{}');
 `, 'utf8');
   await chmod(fixture, 0o755); process.env.ARGS_FILE = path.join(root, 'args.json'); await writeFile(configFile, configText());
 });
-afterEach(async () => { delete process.env.FAKE_MODE; delete process.env.FAKE_VERSION; delete process.env.ARGS_FILE; await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { delete process.env.FAKE_MODE; delete process.env.FAKE_VERSION; delete process.env.ARGS_FILE; delete process.env.CHATGPT_TOKEN; await rm(root, { recursive: true, force: true }); });
 
 test('exact args, persistent incremental output, filtered publication, and idempotence', async () => {
   const config = await loadConfig(configFile); const first = await sync(config, 'secret');
@@ -258,4 +258,68 @@ test('stable device_id is reused on consecutive successful preflight syncs', asy
   assert.equal(deviceIds.length, 2);
   assert.equal(deviceIds[0], deviceIds[1]);
   assert.ok(deviceIds[0]);
+});
+
+test('token_command provider succeeds and exporter receives token through environment', async () => {
+  const config = await loadConfig(configFile);
+  const token = jwt(Math.floor(Date.now() / 1000) + 3600);
+  config.tokenCommand = [process.execPath, '-e', `console.log('${token}')`];
+  const result = await sync(config);
+  assert.equal(result.status, 'ok');
+  const args = JSON.parse(await readFile(path.join(root, 'args.json'), 'utf8'));
+  assert.ok(!args.includes('--token'));
+  const state = JSON.parse(await readFile(path.join(root, 'state', 'collector-state.json'), 'utf8'));
+  const manifest = JSON.parse(await readFile(path.join(root, 'state', 'manifest.json'), 'utf8'));
+  assert.doesNotMatch(JSON.stringify(result), /signature/);
+  assert.doesNotMatch(JSON.stringify(state), /signature/);
+  assert.doesNotMatch(JSON.stringify(manifest), /signature/);
+});
+
+test('token_command provider failures classify correctly', async () => {
+  const base = await loadConfig(configFile);
+  base.tokenCommandTimeoutMs = 50;
+  const token = jwt(Math.floor(Date.now() / 1000) + 3600);
+  const cases = [
+    { name: 'nonzero', command: [process.execPath, '-e', 'process.exit(1)'], classification: 'credential-provider-nonzero' },
+    { name: 'timeout', command: [process.execPath, '-e', 'setTimeout(() => {}, 10000)'], classification: 'credential-provider-timeout' },
+    { name: 'empty', command: [process.execPath, '-e', 'process.stdout.write(\"\")'], classification: 'credential-provider-empty' },
+    { name: 'malformed', command: [process.execPath, '-e', 'console.log(\"not-a-jwt\")'], classification: 'credential-provider-malformed' },
+    { name: 'oversized', command: [process.execPath, '-e', `process.stdout.write('x'.repeat(65537))`], classification: 'credential-provider-malformed' },
+  ];
+  for (const { name, command, classification } of cases) {
+    const config = { ...base, tokenCommand: command };
+    const result = await sync(config);
+    assert.equal(result.classification, classification, name);
+    const state = JSON.parse(await readFile(path.join(root, 'state', 'collector-state.json'), 'utf8'));
+    assert.equal(state.classification, classification, name);
+    assert.doesNotMatch(JSON.stringify(state), /signature/, name);
+    if (name === 'oversized') assert.doesNotMatch(JSON.stringify(state), /x{20,}/, name);
+  }
+  const validConfig = { ...base, tokenCommand: [process.execPath, '-e', `console.log('${token}')`] };
+  assert.equal((await sync(validConfig)).status, 'ok');
+});
+
+test('token_command provider failure preserves prior output and does not leak token', async () => {
+  const config = await loadConfig(configFile);
+  const token = jwt(Math.floor(Date.now() / 1000) + 3600);
+  config.tokenCommand = [process.execPath, '-e', `console.log('${token}')`];
+  await sync(config);
+  const before = await readFile(path.join(root, 'output', 'alpha', 'conversation.md'));
+  config.tokenCommand = [process.execPath, '-e', 'process.exit(1)'];
+  const result = await sync(config);
+  assert.equal(result.classification, 'credential-provider-nonzero');
+  assert.deepEqual(await readFile(path.join(root, 'output', 'alpha', 'conversation.md')), before);
+  const state = JSON.parse(await readFile(path.join(root, 'state', 'collector-state.json'), 'utf8'));
+  assert.doesNotMatch(JSON.stringify(state), /signature/);
+});
+
+test('environment token remains compatible when token_command is not configured', async () => {
+  const config = await loadConfig(configFile);
+  process.env.CHATGPT_TOKEN = 'secret';
+  try {
+    const result = await sync(config);
+    assert.equal(result.status, 'ok');
+  } finally {
+    delete process.env.CHATGPT_TOKEN;
+  }
 });

@@ -4,7 +4,7 @@ A validation-first wrapper around a pinned `chatgpt-exporter` executable. The ex
 
 ## Usage
 
-Copy `config.example.yaml` to `config.yaml`, set the pinned executable, and provide its token through the configured environment variable (normally `CHATGPT_TOKEN`):
+Copy `config.example.yaml` to `config.yaml`, set the pinned executable, and provide its token through `token_command` (an argv list) or the compatible `CHATGPT_TOKEN` environment variable:
 
 ```sh
 chatgpt-markdown-collector sync --config ./config.yaml
@@ -12,7 +12,7 @@ chatgpt-markdown-collector verify --config ./config.yaml
 chatgpt-markdown-collector status --config ./config.yaml
 ```
 
-Each project mapping is run separately with the upstream 1.1.0 arguments `backup`, `-o`, `--incremental`, `--download-files`, `--project`, `--concurrency`, and `--delay`. Set `output: .` to publish a project at the output root; other mappings publish below their configured prefix. When the executable does not support `CHATGPT_TOKEN`, set `supports_token_env: false` to use `backup --token` instead. Persistent raw incremental data is stored under `state/upstream-export/<project>`. Publication is staged and per-file atomic; equal hashes preserve output mtimes, and an owner-aware lock prevents overlap and reclaims locks whose recorded process is gone. Raw runs and manifests stay under `state`; only validated `.md` files and locally referenced assets reach `output`. Existing output is never deleted. A failed, expired, rate-limited, interrupted, or invalid run does not publish. Configured roots and published paths are checked after symlink resolution.
+Each project mapping is run separately with the upstream 1.1.0 arguments `backup`, `-o`, `--incremental`, `--download-files`, `--project`, `--concurrency`, and `--delay`. Set `output: .` to publish a project at the output root; other mappings publish below their configured prefix. `token_command` runs without a shell, has `token_command_timeout_ms`, and uses only trimmed stdout; provider failures are classified as nonzero, timeout, empty, or malformed. Diagnostics are discarded. Persistent raw incremental data is stored under `state/upstream-export/<project>`. Publication is staged and per-file atomic; equal hashes preserve output mtimes, and an owner-aware lock prevents overlap and reclaims locks whose recorded process is gone. Raw runs and manifests stay under `state`; only validated `.md` files and locally referenced assets reach `output`. Existing output is never deleted. A failed, expired, rate-limited, interrupted, or invalid run does not publish. Configured roots and published paths are checked after symlink resolution.
 
 The collector records run times, SHA-256 hashes, project counts and added/changed/unchanged comparisons, upstream identity, auth/publication/error/skipped details, and failure classifications in `state/manifest.json` and `state/collector-state.json`.
 
@@ -45,6 +45,28 @@ Success reports `auth.classification: credential-ready`. Run `sync`, then
 `unset CHATGPT_TOKEN`. This remains an alerted manual-renewal workflow, not a
 production-ready renewable login. Do not copy browser profiles, store account
 passwords/2FA, or build generic cookie extraction around this interface.
+
+### Optional local browser helper
+
+The optional `chatgpt-local-auth` helper keeps a separate, explicitly named
+Playwright profile. It never automates passwords or 2FA, accepts only the
+official `https://chatgpt.com/` session, and rejects repository paths and normal
+browser profiles. The login command is headful so the account owner completes
+login; token, status, and revoke are headless:
+
+```sh
+chatgpt-local-auth login --profile /var/lib/chatgpt-local-auth --browser-executable "$(command -v google-chrome)"
+chatgpt-local-auth status --profile /var/lib/chatgpt-local-auth --browser-executable "$(command -v google-chrome)"
+chatgpt-local-auth token --profile /var/lib/chatgpt-local-auth --browser-executable "$(command -v google-chrome)"
+chatgpt-local-auth revoke --profile /var/lib/chatgpt-local-auth --browser-executable "$(command -v google-chrome)"
+```
+
+If `--browser-executable` is omitted, the helper falls back to `CHATGPT_BROWSER_EXECUTABLE`.
+Only the `token` command writes the bearer token to stdout (for direct use by
+the provider); other diagnostics are JSON or stderr. Configure the collector
+with `token_command: ["chatgpt-local-auth", "token", "--profile", "/var/lib/chatgpt-local-auth", "--browser-executable", "/usr/bin/google-chrome"]`, or rely on the `CHATGPT_BROWSER_EXECUTABLE` environment variable.
+Use `--timeout-ms` to bound an operation. Keep the profile outside this repo,
+and do not put passwords, 2FA codes, or exported cookies in documentation.
 
 ## Nix and Docker
 

@@ -12,18 +12,35 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/chatgpt-markdown-collector
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
       - run: nix flake check
       - run: nix build .#oci -o collector-image.tar.gz
       - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: Load and publish image
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/chatgpt-markdown-collector
+          TOKEN: ${{ github.token }}
         run: |
           loaded=$(docker load < collector-image.tar.gz | awk '{print $3}')
-          if [ "${GITHUB_REF_TYPE}" = tag ]; then tag="${GITHUB_REF_NAME}"; else tag=latest; fi
-          docker tag "$loaded" "$IMAGE:$tag"
-          docker push "$IMAGE:$tag"
+          docker tag "$loaded" "$IMAGE:${GITHUB_SHA}"
+          docker push "$IMAGE:${GITHUB_SHA}"
+          docker tag "$loaded" "$IMAGE:sha-${GITHUB_SHA::7}"
+          docker push "$IMAGE:sha-${GITHUB_SHA::7}"
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            docker tag "$loaded" "$IMAGE:${GITHUB_REF_NAME}"
+            docker push "$IMAGE:${GITHUB_REF_NAME}"
+          else
+            docker tag "$loaded" "$IMAGE:latest"
+            docker push "$IMAGE:latest"
+          fi
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0.17.0
+        with:
+          image: ${{ env.IMAGE }}:${{ github.sha }}
+          format: cyclonedx-json
+          output-file: chatgpt-collector.sbom.cdx.json
+          upload-artifact: true

@@ -11,6 +11,10 @@ exporter:
   delay_ms: 250
   timeout_ms: 600000
 token_env: CHATGPT_TOKEN
+# Optional argv-list credential provider. Its trimmed stdout is used before token_env.
+# Optional browser helper (install/run it separately with an explicit dedicated profile):
+# token_command: ["chatgpt-local-auth", "token", "--profile", "/var/lib/chatgpt-local-auth"]
+token_command_timeout_ms: 15000
 state_dir: ./state
 output_dir: ./output
 projects:

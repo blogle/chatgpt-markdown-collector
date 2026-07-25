@@ -7,7 +7,9 @@
     let
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
       forSystem = system:
-        let pkgs = import nixpkgs { inherit system; };
+        let
+          pkgs = import nixpkgs { inherit system; };
+          revision = if self ? rev then self.rev else self.dirtyRev;
         node = pkgs.nodejs_22;
         upstream = pkgs.buildNpmPackage {
           pname = "chatgpt-exporter";
@@ -31,12 +33,12 @@
             runHook postInstall
           '';
         };
-        collector = pkgs.buildNpmPackage {
+          collector = pkgs.buildNpmPackage {
           pname = "chatgpt-markdown-collector";
           version = "0.1.0";
           nodejs = node;
           src = ./.;
-          npmDepsHash = "sha256-ZBZ7jrXV48WGzJJ6allQXBjjhwEjVAl2cKsSPMPuOdg=";
+          npmDepsHash = "sha256-ve6e5Cjs6JnLXN5eOpGJCsbya5n4qlHfiF7tSQOyAfQ=";
           nativeBuildInputs = [ node pkgs.makeWrapper ];
           installPhase = ''
             runHook preInstall
@@ -63,6 +65,13 @@
             tag = "latest";
             contents = [ runtime pkgs.cacert ];
             config = {
+              Labels = {
+                "org.opencontainers.image.source" = "https://github.com/blogle/chatgpt-markdown-collector";
+                "org.opencontainers.image.version" = "0.1.0";
+                "org.opencontainers.image.revision" = revision;
+                "org.opencontainers.image.title" = "ChatGPT Markdown Collector";
+                "org.opencontainers.image.description" = "Validation-first collector that runs a pinned ChatGPT exporter and publishes Markdown and assets.";
+              };
               Entrypoint = [ "${runtime}/bin/chatgpt-markdown-collector" ];
               WorkingDir = "/data";
               Env = [ "PATH=${runtime}/bin" "NODE_PATH=${runtime}/lib/node_modules" ];
@@ -72,11 +81,14 @@
         };
         devShells.default = pkgs.mkShell { packages = [ node pkgs.nixfmt ]; };
         checks = {
-          syntax = pkgs.runCommand "collector-syntax" { nativeBuildInputs = [ node ]; } ''
-            node --check ${./src/collector.js}
-            node --check ${./src/cli.js}
-            touch $out
-          '';
+           syntax = pkgs.runCommand "collector-syntax" { nativeBuildInputs = [ node ]; } ''
+             node --check ${./src/collector.js}
+             node --check ${./src/cli.js}
+             node --check ${./src/credential-provider.js}
+             node --check ${./src/local-auth.js}
+             node --check ${./src/local-auth-cli.js}
+             touch $out
+           '';
           tests = pkgs.runCommand "collector-tests" { nativeBuildInputs = [ node ]; } ''
              export HOME=$TMPDIR/home; mkdir -p "$HOME"
              work=$(mktemp -d); cp -r ${./.} "$work/source"; chmod -R u+w "$work/source"; cd "$work/source"
