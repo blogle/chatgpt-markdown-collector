@@ -12,5 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: cachix/install-nix-action@v27
+      - run: bash scripts/check-boundaries.sh
+      - run: bash scripts/test-isolated.sh
       - run: nix flake check
       - run: nix build .#collector .#upstream .#oci

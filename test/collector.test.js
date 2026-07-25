@@ -3,12 +3,13 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { loadConfig, status, sync, verify } from '../src/collector.js';
+import { authenticationPreflight, credentialMetadata, loadConfig, status, sync, verify } from '../src/collector.js';
 
 const root = path.resolve('.tmp-test');
 const fixture = path.join(root, 'fake-exporter.mjs');
 const configFile = path.join(root, 'config.yaml');
-const configText = () => `exporter:\n  executable: ${fixture}\n  supports_token_env: true\n  concurrency: 4\n  delay_ms: 17\n  mode: ok\nstate_dir: ${path.join(root, 'state')}\noutput_dir: ${path.join(root, 'output')}\nprojects:\n  - id: alpha\n    name: Alpha\n    output: alpha\n  - id: beta\n    name: Beta\n    output: beta\n`;
+const configText = () => `auth:\n  preflight: false\nexporter:\n  executable: ${fixture}\n  supports_token_env: true\n  concurrency: 4\n  delay_ms: 17\n  mode: ok\nstate_dir: ${path.join(root, 'state')}\noutput_dir: ${path.join(root, 'output')}\nprojects:\n  - id: alpha\n    name: Alpha\n    output: alpha\n  - id: beta\n    name: Beta\n    output: beta\n`;
+const jwt = (exp) => `${Buffer.from('{}').toString('base64url')}.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.signature`;
 
 beforeEach(async () => {
   await rm(root, { recursive: true, force: true }); await mkdir(root, { recursive: true });
@@ -23,6 +24,7 @@ if (!process.env.CHATGPT_TOKEN && !process.argv.includes('--token')) process.exi
 if (process.env.FAKE_MODE === 'fail') process.exit(9);
 if (process.env.FAKE_MODE === 'auth') { console.error('401 unauthorized'); process.exit(1); }
 if (process.env.FAKE_MODE === 'rate') { console.error('rate limit'); process.exit(1); }
+if (process.env.FAKE_MODE === 'leak') { console.error(process.env.CHATGPT_TOKEN || 'no-token'); process.exit(1); }
 if (process.env.FAKE_MODE === 'timeout') await new Promise(() => {});
 if (process.env.FAKE_MODE === 'partial' && project === 'beta') { await mkdir(out, { recursive: true }); await writeFile(path.join(out, 'broken.md'), '[x](missing.png)'); process.exit(0); }
 await mkdir(out, { recursive: true });
@@ -72,7 +74,31 @@ test('token environment and optional token argument branches plus lock overlap',
 });
 
 test('missing token is classified without invoking exporter', async () => {
-  const config = await loadConfig(configFile); assert.equal((await sync(config, undefined)).classification, 'missing-token'); assert.equal((await status(config)).status, 'failed');
+  const config = await loadConfig(configFile); assert.equal((await sync(config, undefined)).classification, 'no-credential'); assert.equal((await status(config)).status, 'failed');
+});
+
+test('authentication metadata and preflight classifications are safe and precise', async () => {
+  const config = await loadConfig(configFile); config.auth.preflight = true;
+  const future = Math.floor(Date.now() / 1000) + 3600; const token = jwt(future);
+  assert.equal(credentialMetadata('not-a-jwt').classification, 'credential-malformed');
+  assert.equal(credentialMetadata(jwt(1)).classification, 'credential-apparently-expired');
+  const ready = await authenticationPreflight(config, token, { fetch: async () => ({ status: 200, ok: true, json: async () => ({ items: [] }) }) });
+  assert.equal(ready.classification, 'credential-ready'); assert.equal(ready.ready, true); assert.ok(ready.expires_at); assert.doesNotMatch(JSON.stringify(ready), /signature/);
+  const rejected = await authenticationPreflight(config, token, { fetch: async () => ({ status: 401, ok: false }) });
+  assert.equal(rejected.classification, 'credential-rejected-401');
+  const changed = await authenticationPreflight(config, token, { fetch: async () => ({ status: 404, ok: false }) });
+  assert.equal(changed.classification, 'upstream-endpoint-changed');
+  const network = await authenticationPreflight(config, token, { fetch: async () => { throw new Error(`request failed ${token}`); } });
+  assert.equal(network.classification, 'network-failure'); assert.doesNotMatch(JSON.stringify(network), /signature/);
+});
+
+test('sync preflight rejection preserves publication and records safe auth state', async () => {
+  const config = await loadConfig(configFile); await sync(config, 'secret');
+  const before = await readFile(path.join(root, 'output', 'alpha', 'conversation.md'));
+  config.auth.preflight = true; const token = jwt(Math.floor(Date.now() / 1000) + 3600);
+  const result = await sync(config, token, { fetch: async () => ({ status: 401, ok: false }) });
+  assert.equal(result.classification, 'credential-rejected-401'); assert.deepEqual(await readFile(path.join(root, 'output', 'alpha', 'conversation.md')), before);
+  assert.doesNotMatch(JSON.stringify(result), /signature/);
 });
 
 test('omitted exporter uses the flake runtime command', async () => {
@@ -89,6 +115,14 @@ test('staged publication is recovered before a later failed export', async () =>
   await rm(destination); const publication = path.join(root, 'state', 'publication', 'interrupted'); const source = path.join(publication, 'conversation.md');
   await mkdir(publication, { recursive: true }); await writeFile(source, content); await writeFile(path.join(publication, 'state.json'), JSON.stringify({ status: 'staged', planned: [{ source, destination, path: 'conversation.md' }] }));
   process.env.FAKE_MODE = 'fail'; assert.equal((await sync(config, 'secret')).classification, 'exporter-failure'); assert.deepEqual(await readFile(destination), content);
+});
+
+test('staged publication recovery rejects destinations outside output', async () => {
+  const config = await loadConfig(configFile); await sync(config, 'secret');
+  const publication = path.join(root, 'state', 'publication', 'hostile'); const source = path.join(publication, 'conversation.md'); const outside = path.join(root, 'outside.md');
+  await mkdir(publication, { recursive: true }); await writeFile(source, 'hostile'); await writeFile(path.join(publication, 'state.json'), JSON.stringify({ status: 'staged', planned: [{ source, destination: outside, path: 'conversation.md' }] }));
+  assert.equal((await sync(config, 'secret')).classification, 'exporter-failure');
+  assert.equal(await stat(outside).catch(() => null), null);
 });
 
 test('root project destination publishes without a project directory', async () => {
@@ -150,4 +184,78 @@ test('CLI returns nonzero for invalid verification', async () => {
   const child = spawn(process.execPath, ['src/cli.js', 'verify', '--config', configFile], { cwd: path.resolve('.'), env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
   const code = await new Promise((resolve) => child.on('close', resolve));
   assert.equal(code, 1);
+});
+
+test('CLI uses distinct exit code for authentication intervention', async () => {
+  await writeFile(configFile, configText().replace('preflight: false', 'preflight: true'));
+  const child = spawn(process.execPath, ['src/cli.js', 'status', '--config', configFile], { cwd: path.resolve('.'), env: { ...process.env, CHATGPT_TOKEN: 'malformed' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(code, 3);
+});
+
+test('preflight timeout classification with tiny timeout and abort-aware fetch', async () => {
+  const config = await loadConfig(configFile);
+  config.auth.preflight = true;
+  config.auth.timeout_ms = 1;
+  const token = jwt(Math.floor(Date.now() / 1000) + 3600);
+  const hanging = await authenticationPreflight(config, token, { fetch: async () => new Promise(() => {}) });
+  assert.equal(hanging.classification, 'preflight-timeout');
+  const controller = new AbortController();
+  const fetch = async (_url, { signal }) => new Promise((_, reject) => {
+    const onAbort = () => reject(new Error('aborted'));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  });
+  controller.abort();
+  const aborted = await authenticationPreflight(config, token, { fetch, signal: controller.signal });
+  assert.equal(aborted.classification, 'interrupted');
+});
+
+test('exporter stderr containing the exact token is redacted from failure and state', async () => {
+  const config = await loadConfig(configFile);
+  process.env.FAKE_MODE = 'leak';
+  const result = await sync(config, 'secret');
+  assert.equal(result.classification, 'exporter-failure');
+  assert.doesNotMatch(result.error, /secret/);
+  const state = JSON.parse(await readFile(path.join(root, 'state', 'collector-state.json'), 'utf8'));
+  assert.doesNotMatch(JSON.stringify(state), /secret/);
+});
+
+test('malformed publication state.json is removed and sync continues', async () => {
+  const config = await loadConfig(configFile);
+  const publication = path.join(root, 'state', 'publication', 'bad');
+  await mkdir(publication, { recursive: true });
+  await writeFile(path.join(publication, 'state.json'), 'not-json');
+  const result = await sync(config, 'secret');
+  assert.equal(result.status, 'ok');
+  assert.equal(await stat(publication).catch(() => null), null);
+});
+
+test('cached status avoids a second fetch within TTL', async () => {
+  const config = await loadConfig(configFile);
+  config.auth.preflight = true;
+  config.auth.status_ttl_ms = 60000;
+  const token = jwt(Math.floor(Date.now() / 1000) + 3600);
+  let fetches = 0;
+  const fetch = async () => { fetches++; return { status: 200, ok: true, json: async () => ({ items: [] }) }; };
+  await sync(config, token, { fetch });
+  assert.equal(fetches, 1);
+  const first = await status(config, token, { fetch });
+  assert.equal(first.auth.status, 'ready');
+  const second = await status(config, token, { fetch });
+  assert.equal(second.auth.status, 'ready');
+  assert.equal(fetches, 1);
+});
+
+test('stable device_id is reused on consecutive successful preflight syncs', async () => {
+  const config = await loadConfig(configFile);
+  config.auth.preflight = true;
+  const token = jwt(Math.floor(Date.now() / 1000) + 3600);
+  const deviceIds = [];
+  const fetch = async (_url, { headers }) => { deviceIds.push(headers['Oai-Device-Id']); return { status: 200, ok: true, json: async () => ({ items: [] }) }; };
+  await sync(config, token, { fetch });
+  await sync(config, token, { fetch });
+  assert.equal(deviceIds.length, 2);
+  assert.equal(deviceIds[0], deviceIds[1]);
+  assert.ok(deviceIds[0]);
 });

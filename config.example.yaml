@@ -1,3 +1,8 @@
+auth:
+  # Enabled by default. Uses the pinned exporter's readiness endpoint before export.
+  preflight: true
+  timeout_ms: 15000
+  status_ttl_ms: 60000
 exporter:
   # Defaults to chatgpt-exporter. The flake runtime puts the pinned binary on PATH.
   # Set false only for an exporter that requires --token instead of CHATGPT_TOKEN.

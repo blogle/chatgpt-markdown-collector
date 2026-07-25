@@ -10,6 +10,7 @@ export const UPSTREAM = {
   integrity: 'sha512-UGMzldzZMwu/551ewevfPJcoqrIY2I6w4btfvFWFLKQflxQubRR4n1U03TWtUUw72NMjL+OyI0nm8CYr6i6pqw==',
   license: 'MIT'
 };
+export const AUTH_ENDPOINT = 'https://chatgpt.com/backend-api/conversations?offset=0&limit=1';
 
 const json = (value) => `${JSON.stringify(value, null, 2)}\n`;
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
@@ -61,9 +62,82 @@ export async function loadConfig(file) {
   return {
     ...config, root, stateDir, outputDir, projects,
     tokenEnv: config.token_env || 'CHATGPT_TOKEN',
+    auth: { preflight: true, endpoint: AUTH_ENDPOINT, timeout_ms: 15000, status_ttl_ms: 60000, ...(config.auth || {}) },
     exporter: { concurrency: 3, delay_ms: 0, timeout_ms: 600000, timeout_grace_ms: 5000, supports_token_env: true, executable: 'chatgpt-exporter', ...(config.exporter || {}),
       executable: /[\\/]/.test((config.exporter || {}).executable || 'chatgpt-exporter') ? resolve(root, (config.exporter || {}).executable) : ((config.exporter || {}).executable || 'chatgpt-exporter') }
   };
+}
+
+export function credentialMetadata(token, now = Date.now()) {
+  if (typeof token !== 'string' || !token.trim()) return { status: 'no-credential', classification: 'no-credential' };
+  const parts = token.split('.');
+  if (parts.length !== 3) return { status: 'invalid', classification: 'credential-malformed' };
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (!Number.isFinite(payload.exp)) return { status: 'invalid', classification: 'credential-malformed' };
+    const expiresAt = new Date(payload.exp * 1000).toISOString();
+    if (payload.exp * 1000 <= now) return { status: 'expired', classification: 'credential-apparently-expired', expires_at: expiresAt };
+    return { status: 'configured', classification: 'credential-configured', expires_at: expiresAt };
+  } catch {
+    return { status: 'invalid', classification: 'credential-malformed' };
+  }
+}
+
+export async function authenticationPreflight(config, token, dependencies = {}) {
+  const metadata = credentialMetadata(token, dependencies.now?.() ?? Date.now());
+  if (metadata.status !== 'configured') return { ...metadata, ready: false };
+  const fetchImpl = dependencies.fetch || globalThis.fetch;
+  if (typeof fetchImpl !== 'function') return { ...metadata, status: 'failed', classification: 'network-failure', ready: false };
+  const timeoutMs = Number.isFinite(config.auth.timeout_ms) ? config.auth.timeout_ms : 15000;
+  const controller = new AbortController();
+  const deviceId = dependencies.deviceId || randomUUID();
+  let timedOut = false;
+  let interrupted = false;
+  const onAbort = () => { interrupted = true; controller.abort(); };
+  if (dependencies.signal?.aborted) onAbort();
+  else dependencies.signal?.addEventListener('abort', onAbort, { once: true });
+  let timeout;
+  let pollTimer;
+  let response;
+  let body;
+  try {
+    const request = fetchImpl(config.auth.endpoint, {
+      method: 'GET', redirect: 'manual',
+      headers: { Authorization: `Bearer ${token}`, 'Oai-Device-Id': deviceId, 'Oai-Language': 'en-US', Accept: 'application/json' },
+      signal: controller.signal
+    });
+    const operation = request.then(async (result) => {
+      if (result.ok) return { result, body: await result.json() };
+      return { result, body: null };
+    });
+    const deadline = new Promise((_, reject) => {
+      timeout = setTimeout(() => { timedOut = true; controller.abort(); reject(new Error('authentication preflight timed out')); }, timeoutMs);
+      const check = () => {
+        if (interrupted) reject(new Error('authentication preflight interrupted'));
+        else pollTimer = setTimeout(check, 10);
+      };
+      pollTimer = setTimeout(check, 10);
+    });
+    ({ result: response, body } = await Promise.race([operation, deadline]));
+  } catch {
+    if (timedOut) return { ...metadata, status: 'failed', classification: 'preflight-timeout', ready: false, device_id: deviceId };
+    if (interrupted) return { ...metadata, status: 'failed', classification: 'interrupted', ready: false, device_id: deviceId };
+    return { ...metadata, status: 'failed', classification: 'network-failure', ready: false, device_id: deviceId };
+  } finally {
+    clearTimeout(timeout);
+    clearTimeout(pollTimer);
+    dependencies.signal?.removeEventListener('abort', onAbort);
+  }
+  const checkedAt = new Date().toISOString();
+  if (response.status === 401) return { ...metadata, status: 'rejected', classification: 'credential-rejected-401', ready: false, checked_at: checkedAt, device_id: deviceId };
+  if (response.status === 403) return { ...metadata, status: 'rejected', classification: 'credential-rejected-403', ready: false, checked_at: checkedAt, device_id: deviceId };
+  if (response.status === 429) return { ...metadata, status: 'rate-limited', classification: 'rate-limit', ready: false, checked_at: checkedAt, device_id: deviceId };
+  if ([301, 302, 303, 307, 308, 404, 405].includes(response.status)) return { ...metadata, status: 'failed', classification: 'upstream-endpoint-changed', ready: false, http_status: response.status, checked_at: checkedAt, device_id: deviceId };
+  if (!response.ok) return { ...metadata, status: 'failed', classification: 'upstream-failure', ready: false, http_status: response.status, checked_at: checkedAt, device_id: deviceId };
+  if (!body || typeof body !== 'object') {
+    return { ...metadata, status: 'failed', classification: 'upstream-endpoint-changed', ready: false, http_status: response.status, checked_at: checkedAt, device_id: deviceId };
+  }
+  return { ...metadata, status: 'ready', classification: 'credential-ready', ready: true, http_status: response.status, checked_at: checkedAt, device_id: deviceId };
 }
 
 async function walk(dir) {
@@ -202,15 +276,25 @@ async function publish(runDir, outputDir, manifest, stateDir) {
   return { changed, skipped };
 }
 
-async function recoverPublications(stateDir) {
+async function recoverPublications(stateDir, outputDir) {
   const root = path.join(stateDir, 'publication');
   if (!(await exists(root))) return;
+  await rejectSymlinkRoot(root, 'publication');
+  await contained(stateDir, root, 'publication', false);
   for (const name of await fs.readdir(root)) {
     const dir = path.join(root, name); const stateFile = path.join(dir, 'state.json');
+    if (!(await fs.lstat(dir)).isDirectory()) continue;
+    await contained(root, dir, 'publication directory', false);
     if (!(await exists(stateFile))) { await fs.rm(dir, { recursive: true, force: true }); continue; }
-    const state = JSON.parse(await fs.readFile(stateFile, 'utf8'));
-    if (state.status !== 'staged') continue;
-    for (const item of state.planned || []) if (await exists(item.source)) await atomicCopy(item.source, item.destination);
+    let state;
+    try { state = JSON.parse(await fs.readFile(stateFile, 'utf8')); } catch { await fs.rm(dir, { recursive: true, force: true }); continue; }
+    if (state?.status !== 'staged' || !Array.isArray(state.planned)) { await fs.rm(dir, { recursive: true, force: true }); continue; }
+    for (const item of state.planned) {
+      if (!item || typeof item.source !== 'string' || typeof item.destination !== 'string') throw new Error('invalid staged publication');
+      await contained(dir, item.source, 'recovery source', false);
+      await contained(outputDir, item.destination, 'recovery destination');
+      if (await exists(item.source)) await atomicCopy(item.source, item.destination);
+    }
     await fs.rm(dir, { recursive: true, force: true });
   }
 }
@@ -225,28 +309,48 @@ function classify(error) {
   return 'exporter-failure';
 }
 
-async function recordFailure(config, classification, error, runId = null, startedAt = null) {
+function redact(value, token) {
+  return token && typeof value === 'string' ? value.split(token).join('[REDACTED]') : value;
+}
+
+function safeError(error, token) {
+  return Object.assign(new Error(redact(error?.message || error, token)), error?.classification ? { classification: error.classification } : {}, error?.code ? { code: error.code } : {}, error?.signal ? { signal: error.signal } : {}, error?.stderr ? { stderr: redact(error.stderr, token) } : {});
+}
+
+async function recordFailure(config, classification, error, runId = null, startedAt = null, auth = null) {
   await fs.mkdir(config.stateDir, { recursive: true });
   await rejectSymlinkRoot(config.stateDir, 'state_dir');
-  const result = { status: 'failed', classification, error: String(error), run_id: runId, upstream: UPSTREAM, started_at: startedAt, completed_at: new Date().toISOString() };
+  const result = { status: 'failed', classification, error: String(error), run_id: runId, upstream: UPSTREAM, started_at: startedAt, completed_at: new Date().toISOString(), ...(auth ? { auth } : {}) };
   await fs.writeFile(path.join(config.stateDir, 'collector-state.json'), json(result));
   return result;
 }
 
-export async function sync(config, token = process.env[config.tokenEnv]) {
+export async function sync(config, token = process.env[config.tokenEnv], dependencies = {}) {
   const startedAt = new Date().toISOString();
   const runId = `${startedAt.replaceAll(':', '-').replaceAll('.', '-')}-${randomUUID()}`;
-  if (!token) return recordFailure(config, 'missing-token', 'token is not set', runId, startedAt);
-  let lock;
+  if (!token) return recordFailure(config, 'no-credential', 'credential is not configured', runId, startedAt, { status: 'no-credential', classification: 'no-credential' });
   const controller = new AbortController();
   const interrupt = () => controller.abort();
+  process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
+  let authResult = null;
+  if (config.auth.preflight) {
+    let priorState = null;
+    try { priorState = JSON.parse(await fs.readFile(path.join(config.stateDir, 'collector-state.json'), 'utf8')); } catch { /* no prior state */ }
+    const auth = await authenticationPreflight(config, token, { ...dependencies, signal: controller.signal, deviceId: priorState?.auth?.device_id });
+    authResult = auth;
+    if (!auth.ready) {
+      process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);
+      return recordFailure(config, auth.classification, 'authentication preflight failed', runId, startedAt, auth);
+    }
+  }
+  let lock;
   try {
     await fs.mkdir(config.stateDir, { recursive: true });
     await rejectSymlinkRoot(config.stateDir, 'state_dir');
     await rejectSymlinkRoot(config.outputDir, 'output_dir');
     lock = await acquireLock(config.stateDir);
     process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
-    await recoverPublications(config.stateDir);
+    await recoverPublications(config.stateDir, config.outputDir);
     const runDir = path.join(config.stateDir, 'runs', runId);
     const prior = await exists(path.join(config.stateDir, 'manifest.json')) ? JSON.parse(await fs.readFile(path.join(config.stateDir, 'manifest.json'), 'utf8')) : null;
     const projects = [];
@@ -267,12 +371,13 @@ export async function sync(config, token = process.env[config.tokenEnv]) {
     }
     const publication = { changed: [], skipped: [] };
     for (const manifest of projects) { const result = await publish(path.join(runDir, manifest.project), config.outputDir, { ...manifest, run_id: runId }, config.stateDir); publication.changed.push(...result.changed); publication.skipped.push(...result.skipped); }
-    const result = { status: 'ok', run_id: runId, started_at: startedAt, completed_at: new Date().toISOString(), upstream: UPSTREAM, configured_projects: config.projects.map(({ id, name, output }) => ({ id, name, output })), projects, publication, auth: { token_env: config.tokenEnv, mode: config.exporter.supports_token_env ? 'environment' : 'argument' }, errors: [], skipped: publication.skipped, hashes: projects.flatMap((project) => project.files.map((file) => ({ project: project.project, ...file }))), counts: projects.reduce((a, x) => ({ markdown: a.markdown + x.counts.markdown, assets: a.assets + x.counts.assets, total: a.total + x.counts.total }), { markdown: 0, assets: 0, total: 0 }) };
+    const result = { status: 'ok', run_id: runId, started_at: startedAt, completed_at: new Date().toISOString(), upstream: UPSTREAM, configured_projects: config.projects.map(({ id, name, output }) => ({ id, name, output })), projects, publication, auth: { ...(authResult || {}), token_env: config.tokenEnv, mode: config.exporter.supports_token_env ? 'environment' : 'argument', ...(config.exporter.supports_token_env === false ? { warning: 'supports_token_env=false uses the less-safe --token compatibility transport' } : {}) }, errors: [], skipped: publication.skipped, hashes: projects.flatMap((project) => project.files.map((file) => ({ project: project.project, ...file }))), counts: projects.reduce((a, x) => ({ markdown: a.markdown + x.counts.markdown, assets: a.assets + x.counts.assets, total: a.total + x.counts.total }), { markdown: 0, assets: 0, total: 0 }) };
     await fs.writeFile(path.join(config.stateDir, 'manifest.json'), json(result));
     await fs.writeFile(path.join(config.stateDir, 'collector-state.json'), json(result));
     return result;
   } catch (error) {
-    return recordFailure(config, classify(error), error.message, runId, startedAt);
+    const safe = safeError(error, token);
+    return recordFailure(config, classify(safe), safe.message, runId, startedAt);
   } finally {
     process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);
     if (lock) await fs.rm(lock, { recursive: true, force: true });
@@ -297,4 +402,13 @@ export async function verify(config) {
   return failures.length ? { status: 'invalid', failures } : { status: 'ok', run_id: manifest.run_id, counts: manifest.counts };
 }
 
-export async function status(config) { const file = path.join(config.stateDir, 'collector-state.json'); return (await exists(file)) ? JSON.parse(await fs.readFile(file, 'utf8')) : { status: 'never-run' }; }
+export async function status(config, token = process.env[config.tokenEnv], dependencies = {}) {
+  const file = path.join(config.stateDir, 'collector-state.json');
+  const collector = (await exists(file)) ? JSON.parse(await fs.readFile(file, 'utf8')) : { status: 'never-run' };
+  const age = collector.auth?.checked_at ? Date.now() - Date.parse(collector.auth.checked_at) : Infinity;
+  const cached = ['ready', 'rejected'].includes(collector.auth?.status) && age >= 0 && age <= config.auth.status_ttl_ms;
+  const auth = config.auth.preflight
+    ? cached ? collector.auth : await authenticationPreflight(config, token, { ...dependencies, deviceId: collector.auth?.device_id })
+    : { status: 'not-checked', classification: 'preflight-disabled', ready: null };
+  return { ...collector, auth };
+}

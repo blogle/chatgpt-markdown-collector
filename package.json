@@ -12,7 +12,9 @@
   "scripts": {
     "test": "node --test",
     "lint": "node --check src/cli.js && node --check src/collector.js",
-    "build": "node --check src/cli.js && node --check src/collector.js"
+    "build": "node --check src/cli.js && node --check src/collector.js",
+    "audit:boundaries": "bash scripts/check-boundaries.sh",
+    "test:isolated": "bash scripts/test-isolated.sh"
   },
   "dependencies": {
     "yaml": "^2.9.0"
