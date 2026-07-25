@@ -1,4 +1,5 @@
-import { chmod, mkdir, readFile, writeFile, rm, stat, utimes } from 'node:fs/promises';
+import { chmod, mkdir, readFile, writeFile, rm, stat, utimes, symlink } from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -22,6 +23,7 @@ if (!process.env.CHATGPT_TOKEN && !process.argv.includes('--token')) process.exi
 if (process.env.FAKE_MODE === 'fail') process.exit(9);
 if (process.env.FAKE_MODE === 'auth') { console.error('401 unauthorized'); process.exit(1); }
 if (process.env.FAKE_MODE === 'rate') { console.error('rate limit'); process.exit(1); }
+if (process.env.FAKE_MODE === 'timeout') await new Promise(() => {});
 if (process.env.FAKE_MODE === 'partial' && project === 'beta') { await mkdir(out, { recursive: true }); await writeFile(path.join(out, 'broken.md'), '[x](missing.png)'); process.exit(0); }
 await mkdir(out, { recursive: true });
 await rm(path.join(out, 'broken.md'), { force: true });
@@ -87,4 +89,65 @@ test('staged publication is recovered before a later failed export', async () =>
   await rm(destination); const publication = path.join(root, 'state', 'publication', 'interrupted'); const source = path.join(publication, 'conversation.md');
   await mkdir(publication, { recursive: true }); await writeFile(source, content); await writeFile(path.join(publication, 'state.json'), JSON.stringify({ status: 'staged', planned: [{ source, destination, path: 'conversation.md' }] }));
   process.env.FAKE_MODE = 'fail'; assert.equal((await sync(config, 'secret')).classification, 'exporter-failure'); assert.deepEqual(await readFile(destination), content);
+});
+
+test('root project destination publishes without a project directory', async () => {
+  const config = await loadConfig(configFile); config.projects = [{ id: 'alpha', name: 'Alpha', output: '.' }];
+  const result = await sync(config, 'secret');
+  assert.equal(result.status, 'ok'); assert.match(await readFile(path.join(root, 'output', 'conversation.md'), 'utf8'), /# alpha/);
+  assert.equal((await verify(config)).status, 'ok');
+});
+
+test('verify reports a content hash mismatch', async () => {
+  const config = await loadConfig(configFile); await sync(config, 'secret');
+  await writeFile(path.join(root, 'output', 'alpha', 'conversation.md'), 'tampered\n');
+  const result = await verify(config);
+  assert.equal(result.status, 'invalid'); assert.equal(result.failures[0].classification, 'hash-mismatch');
+});
+
+test('timeout does not publish and removes the lock', async () => {
+  const config = await loadConfig(configFile); config.exporter.timeout_ms = 30; config.exporter.timeout_grace_ms = 10;
+  process.env.FAKE_MODE = 'timeout';
+  const result = await sync(config, 'secret');
+  assert.equal(result.classification, 'timeout'); assert.equal(await stat(path.join(root, 'state', 'sync.lock')).catch(() => null), null);
+});
+
+test('interruption exits nonzero, preserves output, and removes the lock', async () => {
+  const config = await loadConfig(configFile); await sync(config, 'secret');
+  const before = await readFile(path.join(root, 'output', 'alpha', 'conversation.md'));
+  process.env.FAKE_MODE = 'timeout';
+  const child = spawn(process.execPath, [path.resolve('src/cli.js'), 'sync', '--config', configFile], {
+    cwd: path.resolve('.'), env: { ...process.env, CHATGPT_TOKEN: 'secret' }, stdio: ['ignore', 'pipe', 'pipe']
+  });
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (await stat(path.join(root, 'args.json')).catch(() => null)) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  child.kill('SIGTERM');
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  assert.notEqual(code, 0); assert.deepEqual(await readFile(path.join(root, 'output', 'alpha', 'conversation.md')), before);
+  assert.equal(await stat(path.join(root, 'state', 'sync.lock')).catch(() => null), null);
+});
+
+test('dead owner lock is reclaimed while an owner without metadata remains locked', async () => {
+  const config = await loadConfig(configFile); const lock = path.join(root, 'state', 'sync.lock');
+  await mkdir(lock, { recursive: true }); await writeFile(path.join(lock, 'owner'), JSON.stringify({ pid: 99999999 }));
+  assert.equal((await sync(config, 'secret')).status, 'ok');
+  await mkdir(lock, { recursive: true }); assert.equal((await sync(config, 'secret')).classification, 'locked');
+});
+
+test('symlinked output cannot escape the configured root', async () => {
+  const config = await loadConfig(configFile); await mkdir(path.join(root, 'outside'), { recursive: true });
+  await symlink(path.join(root, 'outside'), path.join(root, 'output'));
+  const result = await sync(config, 'secret');
+  assert.equal(result.classification, 'exporter-failure');
+  assert.equal(await stat(path.join(root, 'outside', 'alpha', 'conversation.md')).catch(() => null), null);
+});
+
+test('CLI returns nonzero for invalid verification', async () => {
+  const config = await loadConfig(configFile); await sync(config, 'secret');
+  await writeFile(path.join(root, 'output', 'alpha', 'conversation.md'), 'tampered\n');
+  const child = spawn(process.execPath, ['src/cli.js', 'verify', '--config', configFile], { cwd: path.resolve('.'), env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(code, 1);
 });

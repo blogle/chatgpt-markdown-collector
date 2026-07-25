@@ -15,12 +15,30 @@ const json = (value) => `${JSON.stringify(value, null, 2)}\n`;
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
 const exists = async (file) => { try { await fs.access(file); return true; } catch { return false; } };
 const resolve = (base, value) => path.resolve(base, value);
-const safeRelative = (value, label) => {
+const safeRelative = (value, label, allowRoot = false) => {
   if (typeof value !== 'string' || !value || path.isAbsolute(value)) throw new Error(`${label} must be relative`);
   const normalized = path.posix.normalize(value.replaceAll('\\', '/'));
-  if (normalized === '.' || normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) throw new Error(`${label} escapes its root`);
+  if ((!allowRoot && normalized === '.') || normalized === '..' || normalized.startsWith('../') || normalized.includes('/../')) throw new Error(`${label} escapes its root`);
   return normalized;
 };
+
+async function contained(root, target, label, allowMissing = true) {
+  const rootReal = await fs.realpath(root);
+  const targetPath = path.resolve(target);
+  let targetReal;
+  try { targetReal = await fs.realpath(targetPath); }
+  catch (error) {
+    if (!allowMissing || error.code !== 'ENOENT') throw error;
+    targetReal = path.join(await fs.realpath(path.dirname(targetPath)), path.basename(targetPath));
+  }
+  if (targetReal !== rootReal && !targetReal.startsWith(`${rootReal}${path.sep}`)) throw new Error(`${label} escapes its root`);
+  return targetReal;
+}
+
+async function rejectSymlinkRoot(root, label) {
+  try { if ((await fs.lstat(root)).isSymbolicLink()) throw new Error(`${label} must not be a symlink`); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
 
 export async function loadConfig(file) {
   const root = path.dirname(path.resolve(file));
@@ -32,7 +50,7 @@ export async function loadConfig(file) {
   const projects = config.projects.map((project) => {
     if (!project?.id || !project?.name) throw new Error('each project needs id and name');
     const id = safeRelative(String(project.id), 'project id');
-    const output = safeRelative(String(project.output || id), `project ${id} output`);
+    const output = safeRelative(String(project.output || id), `project ${id} output`, true);
     return { ...project, id, output };
   });
   const destinations = new Set();
@@ -67,6 +85,7 @@ function referencedFiles(markdown) {
 }
 
 export async function validateStage(stage, project) {
+  await contained(stage, stage, `project ${project.id} stage`, false);
   const files = await walk(stage);
   const markdown = files.filter((file) => path.extname(file).toLowerCase() === '.md');
   if (!markdown.length) throw new Error(`project ${project.id}: exporter produced no markdown`);
@@ -76,13 +95,17 @@ export async function validateStage(stage, project) {
     const text = await fs.readFile(file, 'utf8');
     for (const ref of referencedFiles(text)) {
       const target = path.resolve(path.dirname(file), ref);
-      if (!target.startsWith(`${stage}${path.sep}`) || !(await exists(target))) missing.push({ from: path.relative(stage, file), ref });
-      else selected.add(target);
+      if (!(await exists(target))) missing.push({ from: path.relative(stage, file), ref });
+      else {
+        await contained(stage, target, `attachment ${ref}`, false);
+        selected.add(target);
+      }
     }
   }
   if (missing.length) throw new Error(`project ${project.id}: missing attachment ${JSON.stringify(missing[0])}`);
   const entries = [];
   for (const file of selected) {
+    await contained(stage, file, `project ${project.id} output`, false);
     const data = await fs.readFile(file);
     entries.push({ path: path.relative(stage, file).split(path.sep).join('/'), bytes: data.length, sha256: sha256(data), classification: path.extname(file).toLowerCase() === '.md' ? 'markdown' : 'asset' });
   }
@@ -90,27 +113,44 @@ export async function validateStage(stage, project) {
   return { files: entries, counts: { markdown: entries.filter((x) => x.classification === 'markdown').length, assets: entries.filter((x) => x.classification === 'asset').length, total: entries.length } };
 }
 
-function runExporter(config, project, output, token) {
+function runExporter(config, project, output, token, signal) {
   const args = ['backup', '-o', output, '--incremental', '--download-files', '--project', project.id, '--concurrency', String(config.exporter.concurrency), '--delay', String(config.exporter.delay_ms)];
   const env = { ...process.env, ...(config.exporter.env || {}) };
   if (config.exporter.supports_token_env) env[config.tokenEnv] = token; else args.push('--token', token);
   return new Promise((resolvePromise, reject) => {
     const child = spawn(config.exporter.executable, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '', stderr = '', timedOut = false;
+    let interrupted = false;
     child.stdout.on('data', (chunk) => { stdout += chunk; }); child.stderr.on('data', (chunk) => { stderr += chunk; });
-    const killTimer = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), config.exporter.timeout_grace_ms); }, config.exporter.timeout_ms);
+    let graceTimer;
+    const stop = (classification, signal = 'SIGTERM') => {
+      if (classification === 'timeout') timedOut = true;
+      else interrupted = true;
+      child.kill(signal);
+      graceTimer = setTimeout(() => child.kill('SIGKILL'), config.exporter.timeout_grace_ms);
+    };
+    const killTimer = setTimeout(() => stop('timeout'), config.exporter.timeout_ms);
     child.on('error', reject);
     child.on('close', (code, signal) => {
       clearTimeout(killTimer);
+      if (graceTimer) clearTimeout(graceTimer);
       if (timedOut) reject(Object.assign(new Error(`exporter timed out for ${project.id}`), { classification: 'timeout' }));
+      else if (interrupted) reject(Object.assign(new Error(`exporter interrupted for ${project.id}`), { classification: 'interrupted', signal }));
       else if (code !== 0) reject(Object.assign(new Error(`exporter failed for ${project.id}: code=${code} signal=${signal || 'none'} ${stderr.trim()}`), { code, signal, stderr }));
       else resolvePromise({ stdout, stderr, args });
     });
+    const onAbort = () => stop('interrupted');
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
+    child.once('close', () => signal?.removeEventListener('abort', onAbort));
   });
 }
 
 async function atomicCopy(source, destination) {
   await fs.mkdir(path.dirname(destination), { recursive: true });
+  const parent = path.dirname(destination);
+  await fs.realpath(parent);
+  try { if ((await fs.lstat(destination)).isSymbolicLink()) throw new Error(`refusing symlink destination: ${destination}`); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (await exists(destination)) {
     const [before, after] = await Promise.all([fs.readFile(source), fs.readFile(destination)]);
     if (sha256(before) === sha256(after)) return false;
@@ -121,17 +161,35 @@ async function atomicCopy(source, destination) {
 
 async function acquireLock(stateDir) {
   const lock = path.join(stateDir, 'sync.lock');
-  try { await fs.mkdir(lock); await fs.writeFile(path.join(lock, 'owner'), `${process.pid}\n`); return lock; }
-  catch { throw Object.assign(new Error('another sync is already running'), { classification: 'locked' }); }
+  try { await fs.mkdir(lock); await fs.writeFile(path.join(lock, 'owner'), json({ pid: process.pid, started_at: new Date().toISOString() })); return lock; }
+  catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    let owner;
+    try { owner = JSON.parse(await fs.readFile(path.join(lock, 'owner'), 'utf8')); } catch { owner = null; }
+    let alive = true;
+    if (Number.isInteger(owner?.pid) && owner.pid > 0) {
+      try { process.kill(owner.pid, 0); } catch (probe) { alive = probe.code === 'EPERM'; }
+    }
+    if (owner && !alive) {
+      await fs.rm(lock, { recursive: true, force: true });
+      try { await fs.mkdir(lock); await fs.writeFile(path.join(lock, 'owner'), json({ pid: process.pid, started_at: new Date().toISOString() })); return lock; }
+      catch { /* another process won the stale-lock race */ }
+    }
+    throw Object.assign(new Error('another sync is already running'), { classification: 'locked' });
+  }
 }
 
 async function publish(runDir, outputDir, manifest, stateDir) {
+  await fs.mkdir(outputDir, { recursive: true });
+  await contained(outputDir, outputDir, 'output', false);
   const publishDir = path.join(stateDir, 'publication', manifest.run_id);
   await fs.mkdir(publishDir, { recursive: true });
   const planned = [];
   for (const file of manifest.files) {
-    const destination = path.join(outputDir, manifest.output_prefix, file.path);
     const staged = path.join(publishDir, file.path);
+    const destination = path.join(outputDir, manifest.output_prefix, file.path);
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await contained(outputDir, destination, `manifest file ${file.path}`);
     await fs.mkdir(path.dirname(staged), { recursive: true });
     await fs.copyFile(path.join(runDir, file.path), staged);
     planned.push({ source: staged, destination, path: file.path });
@@ -169,6 +227,7 @@ function classify(error) {
 
 async function recordFailure(config, classification, error, runId = null, startedAt = null) {
   await fs.mkdir(config.stateDir, { recursive: true });
+  await rejectSymlinkRoot(config.stateDir, 'state_dir');
   const result = { status: 'failed', classification, error: String(error), run_id: runId, upstream: UPSTREAM, started_at: startedAt, completed_at: new Date().toISOString() };
   await fs.writeFile(path.join(config.stateDir, 'collector-state.json'), json(result));
   return result;
@@ -179,9 +238,14 @@ export async function sync(config, token = process.env[config.tokenEnv]) {
   const runId = `${startedAt.replaceAll(':', '-').replaceAll('.', '-')}-${randomUUID()}`;
   if (!token) return recordFailure(config, 'missing-token', 'token is not set', runId, startedAt);
   let lock;
+  const controller = new AbortController();
+  const interrupt = () => controller.abort();
   try {
     await fs.mkdir(config.stateDir, { recursive: true });
+    await rejectSymlinkRoot(config.stateDir, 'state_dir');
+    await rejectSymlinkRoot(config.outputDir, 'output_dir');
     lock = await acquireLock(config.stateDir);
+    process.once('SIGINT', interrupt); process.once('SIGTERM', interrupt);
     await recoverPublications(config.stateDir);
     const runDir = path.join(config.stateDir, 'runs', runId);
     const prior = await exists(path.join(config.stateDir, 'manifest.json')) ? JSON.parse(await fs.readFile(path.join(config.stateDir, 'manifest.json'), 'utf8')) : null;
@@ -190,7 +254,9 @@ export async function sync(config, token = process.env[config.tokenEnv]) {
       const upstreamDir = path.join(config.stateDir, 'upstream-export', project.id);
       const stage = path.join(runDir, project.id);
       await fs.mkdir(stage, { recursive: true });
-      await runExporter(config, project, upstreamDir, token);
+      await rejectSymlinkRoot(upstreamDir, `upstream export for ${project.id}`);
+      if (controller.signal.aborted) throw Object.assign(new Error('sync interrupted'), { classification: 'interrupted' });
+      await runExporter(config, project, upstreamDir, token, controller.signal);
       const manifest = await validateStage(upstreamDir, project);
       const previous = prior?.projects?.find((item) => item.project === project.id);
       const old = new Map((previous?.files || []).map((file) => [file.path, file.sha256]));
@@ -207,7 +273,10 @@ export async function sync(config, token = process.env[config.tokenEnv]) {
     return result;
   } catch (error) {
     return recordFailure(config, classify(error), error.message, runId, startedAt);
-  } finally { if (lock) await fs.rm(lock, { recursive: true, force: true }); }
+  } finally {
+    process.removeListener('SIGINT', interrupt); process.removeListener('SIGTERM', interrupt);
+    if (lock) await fs.rm(lock, { recursive: true, force: true });
+  }
 }
 
 export async function verify(config) {
@@ -216,8 +285,12 @@ export async function verify(config) {
   const manifest = JSON.parse(await fs.readFile(manifestFile, 'utf8'));
   if (manifest.upstream?.revision !== UPSTREAM.revision || manifest.upstream?.integrity !== UPSTREAM.integrity) return { status: 'invalid', classification: 'upstream-mismatch', expected: UPSTREAM, actual: manifest.upstream };
   const failures = [];
+  await rejectSymlinkRoot(config.outputDir, 'output_dir');
+  if (!(await exists(config.outputDir))) return { status: 'invalid', failures: (manifest.projects || []).flatMap((project) => (project.files || []).map((file) => ({ path: file.path, classification: 'missing' }))) };
+  await contained(config.outputDir, config.outputDir, 'output', false);
   for (const project of manifest.projects || []) for (const file of project.files || []) {
     const target = path.join(config.outputDir, project.output_prefix, file.path);
+    await contained(config.outputDir, target, `manifest file ${file.path}`);
     if (!(await exists(target))) failures.push({ path: file.path, classification: 'missing' });
     else if (sha256(await fs.readFile(target)) !== file.sha256) failures.push({ path: file.path, classification: 'hash-mismatch' });
   }

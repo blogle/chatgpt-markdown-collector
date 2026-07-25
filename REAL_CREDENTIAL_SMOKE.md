@@ -14,4 +14,4 @@ set -a; . ./.env.local; set +a; nix run .#default -- sync --config ./config.yaml
 
 The command uses the pinned `chatgpt-exporter` supplied by the flake runtime and publishes only after validation. Remove the token from the shell with `unset CHATGPT_TOKEN` when finished. Do not commit `.env.local`, `config.yaml`, `state/`, or `output/`.
 
-The current environment has no `CHATGPT_TOKEN`; a live export has not been run here.
+Live credential execution is intentionally outside automated verification. No credential value is documented here, and this check was not run as part of the repository verification.
