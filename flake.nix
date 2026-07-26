@@ -35,10 +35,10 @@
         };
           collector = pkgs.buildNpmPackage {
           pname = "chatgpt-markdown-collector";
-          version = "0.1.0";
+          version = "0.1.1";
           nodejs = node;
           src = ./.;
-          npmDepsHash = "sha256-ve6e5Cjs6JnLXN5eOpGJCsbya5n4qlHfiF7tSQOyAfQ=";
+          npmDepsHash = "sha256-KtC0CYmcMZr3KdGSgsdkcpX7LX9tAoNY+PUatE7JkX0=";
           nativeBuildInputs = [ node pkgs.makeWrapper ];
           installPhase = ''
             runHook preInstall
@@ -67,14 +67,18 @@
             config = {
               Labels = {
                 "org.opencontainers.image.source" = "https://github.com/blogle/chatgpt-markdown-collector";
-                "org.opencontainers.image.version" = "0.1.0";
+                "org.opencontainers.image.version" = "0.1.1";
                 "org.opencontainers.image.revision" = revision;
                 "org.opencontainers.image.title" = "ChatGPT Markdown Collector";
                 "org.opencontainers.image.description" = "Validation-first collector that runs a pinned ChatGPT exporter and publishes Markdown and assets.";
               };
               Entrypoint = [ "${runtime}/bin/chatgpt-markdown-collector" ];
               WorkingDir = "/data";
-              Env = [ "PATH=${runtime}/bin" "NODE_PATH=${runtime}/lib/node_modules" ];
+              Env = [
+                "PATH=${runtime}/bin"
+                "NODE_PATH=${runtime}/lib/node_modules"
+                "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              ];
               Volumes = { "/data" = {}; "/state" = {}; };
             };
           };
