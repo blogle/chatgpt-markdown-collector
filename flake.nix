@@ -35,10 +35,10 @@
         };
           collector = pkgs.buildNpmPackage {
           pname = "chatgpt-markdown-collector";
-          version = "0.1.1";
+          version = "0.1.2";
           nodejs = node;
           src = ./.;
-          npmDepsHash = "sha256-KtC0CYmcMZr3KdGSgsdkcpX7LX9tAoNY+PUatE7JkX0=";
+          npmDepsHash = "sha256-bMY0JAwgHwWLPHNM5bNrUgRea0H5d6/2X2oslj2/O4c=";
           nativeBuildInputs = [ node pkgs.makeWrapper ];
           installPhase = ''
             runHook preInstall
@@ -67,7 +67,7 @@
             config = {
               Labels = {
                 "org.opencontainers.image.source" = "https://github.com/blogle/chatgpt-markdown-collector";
-                "org.opencontainers.image.version" = "0.1.1";
+                "org.opencontainers.image.version" = "0.1.2";
                 "org.opencontainers.image.revision" = revision;
                 "org.opencontainers.image.title" = "ChatGPT Markdown Collector";
                 "org.opencontainers.image.description" = "Validation-first collector that runs a pinned ChatGPT exporter and publishes Markdown and assets.";

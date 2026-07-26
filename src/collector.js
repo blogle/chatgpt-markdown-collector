@@ -12,6 +12,20 @@ export const UPSTREAM = {
   license: 'MIT'
 };
 export const AUTH_ENDPOINT = 'https://chatgpt.com/backend-api/conversations?offset=0&limit=1';
+const BROWSER_HEADERS = {
+  'Content-Type': 'application/json',
+  'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  Accept: 'application/json',
+  'Accept-Language': 'en-US,en;q=0.9',
+  Referer: 'https://chatgpt.com/',
+  Origin: 'https://chatgpt.com',
+  'Sec-Ch-Ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+  'Sec-Ch-Ua-Mobile': '?0',
+  'Sec-Ch-Ua-Platform': '"macOS"',
+  'Sec-Fetch-Dest': 'empty',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Site': 'same-origin'
+};
 
 const json = (value) => `${JSON.stringify(value, null, 2)}\n`;
 const sha256 = (data) => createHash('sha256').update(data).digest('hex');
@@ -109,7 +123,7 @@ export async function authenticationPreflight(config, token, dependencies = {}) 
   try {
     const request = fetchImpl(config.auth.endpoint, {
       method: 'GET', redirect: 'manual',
-      headers: { Authorization: `Bearer ${token}`, 'Oai-Device-Id': deviceId, 'Oai-Language': 'en-US', Accept: 'application/json' },
+      headers: { ...BROWSER_HEADERS, Authorization: `Bearer ${token}`, 'Oai-Device-Id': deviceId, 'Oai-Language': 'en-US' },
       signal: controller.signal
     });
     const operation = request.then(async (result) => {
