@@ -7,6 +7,7 @@ import { authenticationPreflight, credentialMetadata, loadConfig, status, sync, 
 
 const root = path.resolve('.tmp-test');
 const fixture = path.join(root, 'fake-exporter.mjs');
+const startedFile = path.join(root, 'exporter-started');
 const configFile = path.join(root, 'config.yaml');
 const configText = () => `auth:\n  preflight: false\nexporter:\n  executable: ${fixture}\n  supports_token_env: true\n  concurrency: 4\n  delay_ms: 17\n  mode: ok\nstate_dir: ${path.join(root, 'state')}\noutput_dir: ${path.join(root, 'output')}\nprojects:\n  - id: alpha\n    name: Alpha\n    output: alpha\n  - id: beta\n    name: Beta\n    output: beta\n`;
 const jwt = (exp) => `${Buffer.from('{}').toString('base64url')}.${Buffer.from(JSON.stringify({ exp })).toString('base64url')}.signature`;
@@ -18,6 +19,7 @@ import { mkdir, writeFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 const out = process.argv[process.argv.indexOf('-o') + 1];
 const project = process.argv[process.argv.indexOf('--project') + 1];
+if (process.env.STARTED_FILE) await writeFile(process.env.STARTED_FILE, 'started');
 await writeFile(process.env.ARGS_FILE, JSON.stringify(process.argv));
 if (!process.argv.includes('backup') || !process.argv.includes('--incremental') || !process.argv.includes('--download-files') || process.argv.includes('--request-delay')) process.exit(21);
 if (!process.env.CHATGPT_TOKEN && !process.argv.includes('--token')) process.exit(22);
@@ -25,7 +27,7 @@ if (process.env.FAKE_MODE === 'fail') process.exit(9);
 if (process.env.FAKE_MODE === 'auth') { console.error('401 unauthorized'); process.exit(1); }
 if (process.env.FAKE_MODE === 'rate') { console.error('rate limit'); process.exit(1); }
 if (process.env.FAKE_MODE === 'leak') { console.error(process.env.CHATGPT_TOKEN || 'no-token'); process.exit(1); }
-if (process.env.FAKE_MODE === 'timeout') await new Promise(() => {});
+if (process.env.FAKE_MODE === 'timeout') await new Promise((resolve) => setTimeout(resolve, 60_000));
 if (process.env.FAKE_MODE === 'partial' && project === 'beta') { await mkdir(out, { recursive: true }); await writeFile(path.join(out, 'broken.md'), '[x](missing.png)'); process.exit(0); }
 await mkdir(out, { recursive: true });
 await rm(path.join(out, 'broken.md'), { force: true });
@@ -33,9 +35,9 @@ await writeFile(path.join(out, 'conversation.md'), '# ' + project + (process.env
 await writeFile(path.join(out, 'asset.png'), 'asset-' + project);
 await writeFile(path.join(out, 'private.json'), '{}');
 `, 'utf8');
-  await chmod(fixture, 0o755); process.env.ARGS_FILE = path.join(root, 'args.json'); await writeFile(configFile, configText());
+  await chmod(fixture, 0o755); process.env.ARGS_FILE = path.join(root, 'args.json'); process.env.STARTED_FILE = startedFile; await writeFile(configFile, configText());
 });
-afterEach(async () => { delete process.env.FAKE_MODE; delete process.env.FAKE_VERSION; delete process.env.ARGS_FILE; delete process.env.CHATGPT_TOKEN; await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { delete process.env.FAKE_MODE; delete process.env.FAKE_VERSION; delete process.env.ARGS_FILE; delete process.env.STARTED_FILE; delete process.env.CHATGPT_TOKEN; await rm(root, { recursive: true, force: true }); });
 
 test('exact args, persistent incremental output, filtered publication, and idempotence', async () => {
   const config = await loadConfig(configFile); const first = await sync(config, 'secret');
@@ -140,9 +142,15 @@ test('verify reports a content hash mismatch', async () => {
 });
 
 test('timeout does not publish and removes the lock', async () => {
-  const config = await loadConfig(configFile); config.exporter.timeout_ms = 30; config.exporter.timeout_grace_ms = 10;
+  const config = await loadConfig(configFile); config.exporter.timeout_ms = 250; config.exporter.timeout_grace_ms = 10;
   process.env.FAKE_MODE = 'timeout';
-  const result = await sync(config, 'secret');
+  const resultPromise = sync(config, 'secret');
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (await stat(startedFile).catch(() => null)) break;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.ok(await stat(startedFile).catch(() => null));
+  const result = await resultPromise;
   assert.equal(result.classification, 'timeout'); assert.equal(await stat(path.join(root, 'state', 'sync.lock')).catch(() => null), null);
 });
 
