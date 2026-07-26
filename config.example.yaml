@@ -15,6 +15,9 @@ token_env: CHATGPT_TOKEN
 # Optional browser helper (install/run it separately with an explicit dedicated profile):
 # token_command: ["chatgpt-local-auth", "token", "--profile", "/var/lib/chatgpt-local-auth"]
 token_command_timeout_ms: 15000
+publication:
+  # Oversized conversations become a small transclusion index plus message-boundary parts.
+  max_markdown_bytes: 49152
 state_dir: ./state
 output_dir: ./output
 projects:

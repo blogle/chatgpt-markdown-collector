@@ -70,6 +70,8 @@ export async function loadConfig(file) {
     return { ...project, id, output };
   });
   if (config.token_command !== undefined && !configuredTokenCommand(config.token_command)) throw new Error('token_command must be a non-empty argv list');
+  const maxMarkdownBytes = Number(config.publication?.max_markdown_bytes ?? 49152);
+  if (!Number.isInteger(maxMarkdownBytes) || maxMarkdownBytes < 4096) throw new Error('publication.max_markdown_bytes must be an integer >= 4096');
   const tokenEnv = config.token_env || 'CHATGPT_TOKEN';
   if (typeof tokenEnv !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokenEnv)) throw new Error('token_env must be a valid environment variable name');
   const destinations = new Set();
@@ -83,6 +85,7 @@ export async function loadConfig(file) {
     tokenCommand: config.token_command,
     tokenCommandTimeoutMs: Number.isFinite(config.token_command_timeout_ms) ? config.token_command_timeout_ms : 15000,
     auth: { preflight: true, endpoint: AUTH_ENDPOINT, timeout_ms: 15000, status_ttl_ms: 60000, ...(config.auth || {}) },
+    publication: { max_markdown_bytes: maxMarkdownBytes },
     exporter: { concurrency: 3, delay_ms: 0, timeout_ms: 600000, timeout_grace_ms: 5000, supports_token_env: true, executable: 'chatgpt-exporter', ...(config.exporter || {}),
       executable: /[\\/]/.test((config.exporter || {}).executable || 'chatgpt-exporter') ? resolve(root, (config.exporter || {}).executable) : ((config.exporter || {}).executable || 'chatgpt-exporter') }
   };
@@ -176,6 +179,155 @@ function referencedFiles(markdown) {
     if (ref && !/^(?:https?:|data:|#)/i.test(ref)) refs.add(ref);
   }
   return refs;
+}
+
+function yamlString(value) { return JSON.stringify(String(value ?? '')); }
+
+function messageText(message) {
+  const content = message?.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content?.parts)) return content.parts.map((part) => typeof part === 'string' ? part : part?.content_type === 'image_asset_pointer' ? '[image]' : '').join('\n');
+  if (typeof content?.text === 'string') return content.text;
+  return '';
+}
+
+function activeNodes(data) {
+  const mapping = data?.mapping;
+  if (!mapping || typeof mapping !== 'object') throw new Error('transclusion JSON has no mapping');
+  const get = (id) => mapping[id] || null;
+  let node = data.current_node ? get(data.current_node) : null;
+  if (node) {
+    const result = [];
+    while (node) { result.push(node); node = node.parent ? get(node.parent) : null; }
+    return result.reverse();
+  }
+  let root = get('root') || Object.values(mapping).find((candidate) => !candidate?.parent);
+  const result = [];
+  while (root) {
+    result.push(root);
+    const child = root.children?.[0];
+    root = child ? get(child) : null;
+  }
+  return result;
+}
+
+function expectedMessages(data) {
+  return activeNodes(data).flatMap((node) => {
+    const message = node?.message;
+    const role = message?.author?.role;
+    const weight = message?.weight ?? node?.weight;
+    if (!message || !message.id || !role || role === 'system' || role === 'tool' || message.metadata?.is_visually_hidden_from_conversation || weight === 0 || !messageText(message).trim()) return [];
+    return [{ id: String(message.id), role: String(role).toLowerCase() }];
+  });
+}
+
+function formattedRole(role) {
+  if (role === 'user') return 'User';
+  if (role === 'assistant') return 'Assistant';
+  return role ? role[0].toUpperCase() + role.slice(1) : '';
+}
+
+function markdownSegments(markdown, expected) {
+  const markers = [];
+  let offset = 0;
+  for (let index = 0; index < expected.length; index++) {
+    const marker = `**${formattedRole(expected[index].role)}:**\n\n`;
+    if (index === 0) {
+      const markerIndex = markdown.indexOf(marker, offset);
+      if (markerIndex < 0) break;
+      markers.push({ index: markerIndex, separator: markerIndex, role: expected[index].role });
+      offset = markerIndex + marker.length;
+    } else {
+      const delimiter = `\n\n---\n\n${marker}`;
+      const separator = markdown.indexOf(delimiter, offset);
+      if (separator < 0) break;
+      markers.push({ index: separator + 7, separator, role: expected[index].role });
+      offset = separator + delimiter.length;
+    }
+  }
+  return markers.map((marker, index) => ({
+    role: marker.role,
+    text: markdown.slice(marker.index, markers[index + 1]?.separator ?? markdown.length)
+  }));
+}
+
+function renderPart(title, conversation, part, parts, messages) {
+  const frontmatter = `---\ntype: chatgpt-conversation-part\nsource: chatgpt\nschema: chatgpt-collector/markdown/v1\nconversation: ${yamlString(conversation)}\ntitle: ${yamlString(title)}\npart: ${part}\nparts: ${parts}\n---\n\n`;
+  const body = messages.map((message) => `${message.text.trimEnd()}\n\n^chatgpt-${message.id.replace(/[^A-Za-z0-9-]/g, '-')}\n`).join('\n---\n\n');
+  return `${frontmatter}# ${title} - Part ${part} of ${parts}\n\n${body}`;
+}
+
+function groupMessages(title, conversation, messages, maxBytes) {
+  let parts = messages.length || 1;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const groups = [];
+    let current = [];
+    for (const message of messages) {
+      const candidate = [...current, message];
+      if (current.length && Buffer.byteLength(renderPart(title, conversation, 1, parts, candidate)) > maxBytes) {
+        groups.push(current); current = [message];
+      } else current = candidate;
+    }
+    if (current.length) groups.push(current);
+    if (groups.length === parts) return groups;
+    parts = groups.length;
+  }
+  return (() => {
+    const groups = []; let current = [];
+    for (const message of messages) {
+      if (current.length && Buffer.byteLength(renderPart(title, conversation, 1, parts, [...current, message])) > maxBytes) { groups.push(current); current = []; }
+      current.push(message);
+    }
+    if (current.length) groups.push(current);
+    return groups;
+  })();
+}
+
+export async function transformStage(stage, project, maxMarkdownBytes) {
+  const files = (await walk(stage)).filter((file) => path.extname(file).toLowerCase() === '.md' && !/\.part-\d{4}\.md$/.test(file));
+  for (const file of files) {
+    if ((await fs.stat(file)).size <= maxMarkdownBytes) continue;
+    const jsonFile = `${file.slice(0, -3)}.json`;
+    if (!(await exists(jsonFile))) throw Object.assign(new Error(`project ${project.id}: oversized markdown has no adjacent JSON: ${path.relative(stage, file)}`), { classification: 'invalid-output' });
+    let data;
+    try { data = JSON.parse(await fs.readFile(jsonFile, 'utf8')); }
+    catch { throw Object.assign(new Error(`project ${project.id}: malformed conversation JSON: ${path.relative(stage, jsonFile)}`), { classification: 'invalid-output' }); }
+    const expected = expectedMessages(data);
+    if (!expected.length) throw Object.assign(new Error(`project ${project.id}: oversized conversation has no publishable messages: ${path.relative(stage, jsonFile)}`), { classification: 'invalid-output' });
+    const segments = markdownSegments(await fs.readFile(file, 'utf8'), expected);
+    if (segments.length !== expected.length || segments.some((segment, index) => segment.role !== expected[index].role)) {
+      const mismatch = segments.findIndex((segment, index) => segment.role !== expected[index]?.role);
+      throw Object.assign(new Error(`project ${project.id}: markdown roles/messages do not match ${path.relative(stage, jsonFile)} (markdown=${segments.length}, json=${expected.length}, mismatch=${mismatch}, markdown_role=${segments[mismatch]?.role || 'none'}, json_role=${expected[mismatch]?.role || 'none'})`), { classification: 'invalid-output' });
+    }
+    const messages = segments.map((segment, index) => ({ ...segment, id: expected[index].id }));
+    const title = String(data.title || (await fs.readFile(file, 'utf8')).match(/^#\s+(.+)$/m)?.[1] || path.basename(file, '.md'));
+    const timestamp = data.create_time ?? data.update_time;
+    const date = Number.isFinite(Number(timestamp)) ? new Date(Number(timestamp) * 1000).toISOString() : 'unknown';
+    const conversation = String(data.conversation_id || path.basename(file, '.md'));
+    const groups = groupMessages(title, conversation, messages, maxMarkdownBytes);
+    const relativeBase = path.basename(file, '.md');
+    const partPaths = groups.map((_, index) => `${relativeBase}.part-${String(index + 1).padStart(4, '0')}.md`);
+    for (let index = 0; index < groups.length; index++) await fs.writeFile(path.join(path.dirname(file), partPaths[index]), renderPart(title, conversation, index + 1, groups.length, groups[index]));
+    const frontmatter = `---\ntype: chatgpt-conversation\nsource: chatgpt\nschema: chatgpt-collector/markdown/v1\nconversation: ${yamlString(conversation)}\ntitle: ${yamlString(title)}\nparts: ${groups.length}\n---\n\n`;
+    const links = partPaths.map((part) => `![[${path.relative(stage, path.join(path.dirname(file), part)).split(path.sep).join('/').replace(/\.md$/, '')}]]`).join('\n');
+    await fs.writeFile(file, `${frontmatter}# ${title}\n\n*${date.slice(0, 10)}*\n\n${links}\n`);
+  }
+}
+
+export async function removeStaleParts(prior, projects, outputDir) {
+  const removed = [];
+  const current = new Map(projects.map((project) => [project.project, new Set(project.files.map((file) => file.path))]));
+  for (const project of prior?.projects || []) {
+    const present = current.get(project.project) || new Set();
+    for (const file of project.files || []) {
+      if (!/\.part-\d{4}\.md$/.test(file.path) || present.has(file.path)) continue;
+      const target = path.join(outputDir, project.output_prefix, file.path);
+      await contained(outputDir, target, `stale generated part ${file.path}`);
+      await fs.rm(target, { force: true });
+      removed.push(file.path);
+    }
+  }
+  return removed;
 }
 
 export async function validateStage(stage, project) {
@@ -390,16 +542,18 @@ export async function sync(config, token, dependencies = {}) {
       await rejectSymlinkRoot(upstreamDir, `upstream export for ${project.id}`);
       if (controller.signal.aborted) throw Object.assign(new Error('sync interrupted'), { classification: 'interrupted' });
       await runExporter(config, project, upstreamDir, token, controller.signal);
-      const manifest = await validateStage(upstreamDir, project);
+      await fs.cp(upstreamDir, stage, { recursive: true });
+      await transformStage(stage, project, config.publication.max_markdown_bytes);
+      const manifest = await validateStage(stage, project);
       const previous = prior?.projects?.find((item) => item.project === project.id);
       const old = new Map((previous?.files || []).map((file) => [file.path, file.sha256]));
       const comparison = { added: 0, changed: 0, unchanged: 0 };
       for (const file of manifest.files) old.has(file.path) ? (old.get(file.path) === file.sha256 ? comparison.unchanged++ : comparison.changed++) : comparison.added++;
-      await fs.cp(upstreamDir, stage, { recursive: true });
       projects.push({ project: project.id, name: project.name, output_prefix: project.output, ...manifest, comparison });
     }
-    const publication = { changed: [], skipped: [] };
+    const publication = { changed: [], skipped: [], removed: [] };
     for (const manifest of projects) { const result = await publish(path.join(runDir, manifest.project), config.outputDir, { ...manifest, run_id: runId }, config.stateDir); publication.changed.push(...result.changed); publication.skipped.push(...result.skipped); }
+    publication.removed = await removeStaleParts(prior, projects, config.outputDir);
     const result = { status: 'ok', run_id: runId, started_at: startedAt, completed_at: new Date().toISOString(), upstream: UPSTREAM, configured_projects: config.projects.map(({ id, name, output }) => ({ id, name, output })), projects, publication, auth: { ...(authResult || {}), token_env: config.tokenEnv, mode: config.exporter.supports_token_env ? 'environment' : 'argument', ...(config.exporter.supports_token_env === false ? { warning: 'supports_token_env=false uses the less-safe --token compatibility transport' } : {}) }, errors: [], skipped: publication.skipped, hashes: projects.flatMap((project) => project.files.map((file) => ({ project: project.project, ...file }))), counts: projects.reduce((a, x) => ({ markdown: a.markdown + x.counts.markdown, assets: a.assets + x.counts.assets, total: a.total + x.counts.total }), { markdown: 0, assets: 0, total: 0 }) };
     await fs.writeFile(path.join(config.stateDir, 'manifest.json'), json(result));
     await fs.writeFile(path.join(config.stateDir, 'collector-state.json'), json(result));
