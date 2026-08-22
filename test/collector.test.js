@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { test, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { authenticationPreflight, credentialMetadata, loadConfig, status, sync, verify } from '../src/collector.js';
+import { authenticationPreflight, credentialMetadata, loadConfig, status, sync, validateStage, verify } from '../src/collector.js';
 
 const root = path.resolve('.tmp-test');
 const fixture = path.join(root, 'fake-exporter.mjs');
@@ -330,4 +330,30 @@ test('environment token remains compatible when token_command is not configured'
   } finally {
     delete process.env.CHATGPT_TOKEN;
   }
+});
+
+test('validateStage skips non-file URI schemes like sediment:// in markdown references', async () => {
+  const stage = path.join(root, 'stage-test');
+  await mkdir(path.join(stage, 'conversations'), { recursive: true });
+  await writeFile(path.join(stage, 'conversations', 'chat.md'), [
+    '# Conversation',
+    '',
+    'Here is an image:',
+    '',
+    '![image](sediment://file_000000009f3081fd826112cab90d0a77)',
+    '',
+    'And a local file:',
+    '',
+    '![local](./attachment.png)',
+    '',
+  ].join('\n'));
+  await writeFile(path.join(stage, 'conversations', 'attachment.png'), 'fake-png');
+  const project = { id: 'test-project', name: 'Test', output: '.' };
+  const result = await validateStage(stage, project);
+  assert.equal(result.counts.markdown, 1);
+  assert.equal(result.counts.assets, 1);
+  assert.equal(result.counts.total, 2);
+  const paths = result.files.map((f) => f.path);
+  assert.ok(paths.includes('conversations/chat.md'));
+  assert.ok(paths.includes('conversations/attachment.png'));
 });
