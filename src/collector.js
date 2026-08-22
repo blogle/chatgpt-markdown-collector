@@ -348,7 +348,8 @@ export async function validateStage(stage, project) {
       }
     }
   }
-  if (missing.length) throw new Error(`project ${project.id}: missing attachment ${JSON.stringify(missing[0])}`);
+  const realMissing = missing.filter((m) => !/\.md$/i.test(m.ref));
+  if (realMissing.length) throw new Error(`project ${project.id}: missing attachment ${JSON.stringify(realMissing[0])}`);
   const entries = [];
   for (const file of selected) {
     await contained(stage, file, `project ${project.id} output`, false);
