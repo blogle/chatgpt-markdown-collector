@@ -176,7 +176,7 @@ function referencedFiles(markdown) {
   const refs = new Set();
   for (const match of markdown.matchAll(/!?(?:\[[^\]]*\])\(([^)]+)\)/g)) {
     const ref = match[1].split(/[?#]/, 1)[0].trim();
-    if (ref && !/^(?:https?:|data:|#)/i.test(ref)) refs.add(ref);
+    if (ref && !/^(?:https?:|data:|[\w][\w+.-]*:|#)/i.test(ref)) refs.add(ref);
   }
   return refs;
 }
